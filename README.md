@@ -96,7 +96,7 @@ Migrations add deduplication, trigram indexing for fast fuzzy lookup, and projec
 
 ## About
 
-Built by **Bartłomiej Dobranowski**, Computer Science student (Erasmus+ in Porto).
+Built by **Bartłomiej Dobranowski**, Computer Science student.
 Margio is my engineering thesis and a product I am developing toward launch.
 
 - GitHub: [@xtfee](https://github.com/xtfee)
