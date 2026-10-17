@@ -7,9 +7,13 @@ Electricians, plumbers and construction firms bid on jobs using cost estimates f
 ![Margio dashboard](docs/screenshots/dashboard.png)
 
 > 🛠 **Status:** engineering thesis project and a commercial product in active development.
+>
 > 🚧 **Actively built and tested.** The app is continuously improved, so some features are still evolving and parts of the live demo may be rough around the edges.
+>
 > 🔒 **Closed-source.** The code is private. This repository is a technical case study.
-> ▶️ **Live demo:** [margiotest.vercel.app](https://margiotest.vercel.app) &nbsp;·&nbsp; demo login: `demo@margio.app` / `demodemo`
+>
+> ▶️ **Live demo:** [margiotest.vercel.app](https://margiotest.vercel.app) &nbsp;·&nbsp; demo login: `demo@margio.app` / `demodemo` (a guided "Jak zacząć" tour opens after login)
+>
 > 💬 Happy to walk through the code and architecture in an interview.
 
 ---
@@ -17,13 +21,15 @@ Electricians, plumbers and construction firms bid on jobs using cost estimates f
 ## What it does
 
 - **Ingest price lists** from file upload (CSV / XLSX) or a supplier URL, with **automatic column mapping**. The app figures out which column is SKU, EAN, name, price or unit, even when every supplier formats differently.
-- **Match estimate items to catalog products** through a layered pipeline (exact, then parameter extraction, then semantic search) with a **confidence score** on every match.
-- **Human-in-the-loop** for uncertain matches. The user's decision is saved to a per-company dictionary, so the system gets smarter for that tenant over time.
-- **Real-time margin alerts.** When a supplier price change pushes a line below the target margin, the affected projects are flagged.
+- **Match estimate items to catalog products** through a layered pipeline (exact, then parameter extraction, then semantic search, then optional LLM re-ranking) with a **confidence score** on every match.
+- **Human-in-the-loop** for uncertain matches, with an AI suggestion when the LLM layer is on. The user's decision is saved to a per-company dictionary, which is **guarded against wrong clicks** so one mistake cannot spread to every future quote.
+- **Unit conversion.** A kosztorys line in metres or pieces is priced correctly against a catalog sold per drum, roll or pack of 100. Mismatched units never get auto-accepted.
+- **Margin or markup.** Each company picks which one is the headline figure, and the other is always shown alongside.
+- **Real-time margin alerts.** When a supplier price change pushes a line below the target, the affected projects are flagged.
 - **Supplier optimization.** Split a basket across suppliers to minimize total cost.
-- **Export** supplier-split quotes to **Excel and PDF** (in Polish, for the end client).
+- **Export** supplier-split quotes to **Excel and PDF** (in Polish, for the end client), with orders rounded up to whole supplier packages.
 - **Project snapshots and diffs.** Freeze a quote and see exactly what changed when prices move.
-- **Multi-tenant.** Every company's data is fully isolated.
+- **Multi-tenant.** Every company's data is fully isolated, enforced by an automated test.
 
 ---
 
@@ -37,18 +43,20 @@ The interesting part is the **matching engine**, a deterministic-first, AI-last 
 Estimate item
    │
    ▼
-Layer 0  Normalization       parse CSV/XLSX, clean EAN/SKU, unify units
+Layer 0  Normalization       parse CSV/XLSX, locale-aware numbers, clean EAN/SKU, unify units
    ▼
-Layer 1  Exact Match         EAN → SKU → company dictionary → normalized name
+Layer 1  Exact Match         EAN → SKU → company dictionary (trust-checked) → normalized name
    ▼
-Layer 2  Parameter Extract   pull technical params (cross-sections, diameters), no AI
+Layer 2  Parameter Extract   technical params (cross-sections, diameters, volume), no AI
    ▼
 Layer 3  Semantic Search     pgvector similarity over catalog embeddings
    ▼
 Confidence Aggregator        scores the candidates and routes the item:
    ├─ high     → AUTO_ACCEPT
-   ├─ medium   → LLM re-ranking (planned) or human review
+   ├─ medium   → Layer 4: LLM re-ranking (never sees prices) → auto-accept or review with a suggestion
    └─ low      → Human-in-the-loop → company dictionary
+   ▼
+Unit gate                    auto-accept with an unconvertible unit → human review
 ```
 
 **Why this order matters:** the cheap, deterministic layers resolve the easy majority of items first, so the expensive, fuzzy layers only run on what is genuinely ambiguous. It is faster, cheaper and far more predictable than throwing every line at a vector search or an LLM.
@@ -66,14 +74,20 @@ Every item gets a confidence score that decides its path: auto-accept, re-rank o
 **Margin integrity: contract price vs live price.**
 A quote's margin is calculated on the **contract price** the contractor committed to, while alerts fire on **today's live price**. These are deliberately two separate cost bases. Approving a quote locks in the margin the user agreed to, and a separate live-cost check still warns "if you bought this today, you'd be below your threshold." Collapsing them into one number would either freeze the margin and silence drift alerts, or let an agreed quote's numbers move under the contractor's feet. Keeping them split is what makes both the committed margin and the drift alert trustworthy.
 
-**Strict multi-tenant isolation.**
-Every data-access function takes `tenantId`, and it is **only ever read from the verified JWT session, never from the request body.** No query that touches company data runs without a tenant filter. This is enforced as a hard rule across every route that reads or writes tenant data.
+**Strict multi-tenant isolation, enforced by a test.**
+Every data-access function takes `tenantId`, and it is **only ever read from the verified JWT session, never from the request body.** A test scans every SQL string in the codebase (100+ queries) and fails the test suite on a data query without a tenant filter, so the rule cannot quietly erode. The Supabase public API roles are locked out of the database entirely (privileges revoked, RLS default-deny).
 
-**Prices stay out of the AI.**
-By design, the planned LLM re-ranking layer receives product candidates but **never sees prices.** Pricing logic stays deterministic and auditable, and the model cannot be nudged by cost.
+**An LLM layer that is measured, not just added.**
+Layer 4 sends only ambiguous mid-confidence items to the model, with the top 5 candidates and **no prices**: the candidate type has no price field, so the type system rules it out. The answer is a strict JSON schema where the choice is an enum of the shown candidates or `null`, so the model cannot invent an option. Any error, timeout or invalid answer falls back to human review. The routing decision is a single side-effect-free function, `decideMatch()`, shared by the production route and an evaluation script, so the benchmark exercises exactly the production code. The labelled set has 57 estimate-style lines, a third of them traps (`B16` vs `B20`, `3×1.5` vs `3×2.5`, products not in the catalog), and the script reports accuracy, false auto-accepts, cost and latency before vs after the LLM, plus a confidence-threshold sweep so the auto-accept cutoff is chosen from data rather than guessed. The layer is off by default and toggled by an environment variable.
 
-**Safe ingestion of untrusted files.**
-Uploaded price lists are validated and processed inside a file sandbox (type checks, size limits), and heavy ingestion runs through a background job processor rather than blocking the request.
+**A company dictionary that cannot be poisoned by one click.**
+A manual decision used to become a rule that auto-accepted every future identical line. Now a human-sourced entry is trusted only when its wording is close to the chosen product (trigram similarity) or the same choice was confirmed at least twice; otherwise the item goes back through the pipeline. Users can review and delete entries in settings.
+
+**Units and numbers that real price lists actually use.**
+Polish price lists write `1.234,56` and sell cable per 100 m drum. Numbers are parsed by locale (the last separator is the decimal one), `3x2,5` keeps its decimal comma instead of collapsing into a different cable, and pack sizes are read from product names so a line in metres is costed per metre, not per drum.
+
+**Safe ingestion of untrusted input.**
+Uploaded price lists are validated inside a file sandbox (type checks, size limits). URL imports are size-capped while streaming and refuse private and link-local addresses (SSRF). Heavy ingestion runs through a background job processor rather than blocking the request. Login and registration are rate-limited in the database, since serverless instances share no memory.
 
 **Price-list dedup, snapshots and diffs.**
 Migrations add deduplication, trigram indexing for fast fuzzy lookup, and project snapshots, so a quote can be frozen and diffed against live prices later.
@@ -88,8 +102,9 @@ Migrations add deduplication, trigram indexing for fast fuzzy lookup, and projec
 | Database | PostgreSQL 17 on Supabase, `pgvector`, `pg_trgm` |
 | Data access | `node-postgres` (raw parameterized SQL, no ORM) |
 | Auth | Custom JWT (`jose` / `jsonwebtoken`) + bcrypt, multi-tenant |
-| AI | OpenAI embeddings (semantic search); optional LLM re-ranking on the roadmap |
+| AI | OpenAI embeddings (semantic search), LLM re-ranking with strict structured output (optional layer) |
 | Files | `papaparse`, `xlsx`, `exceljs`, `@react-pdf/renderer` |
+| Testing | Vitest (101 unit tests, incl. the tenant-filter guard), DB checks in rolled-back transactions |
 | Deploy | Vercel |
 
 ---
