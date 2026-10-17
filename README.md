@@ -47,13 +47,14 @@ Layer 0  Normalization       parse CSV/XLSX, locale-aware numbers, clean EAN/SKU
    ▼
 Layer 1  Exact Match         EAN → SKU → company dictionary (trust-checked) → normalized name
    ▼
-Layer 2  Parameter Extract   technical params (cross-sections, diameters, volume), no AI
+Layer 2  Parameter Extract   technical params (cross-section, current, IP, power, voltage, colour…), no AI
    ▼
 Layer 3  Semantic Search     pgvector similarity over catalog embeddings
    ▼
 Confidence Aggregator        scores the candidates and routes the item:
    ├─ high     → AUTO_ACCEPT
    ├─ medium   → Layer 4: LLM re-ranking (never sees prices) → auto-accept or review with a suggestion
+   │             (with Layer 4 on, high-similarity matches are confirmed by the LLM too)
    └─ low      → Human-in-the-loop → company dictionary
    ▼
 Unit gate                    auto-accept with an unconvertible unit → human review
@@ -78,7 +79,18 @@ A quote's margin is calculated on the **contract price** the contractor committe
 Every data-access function takes `tenantId`, and it is **only ever read from the verified JWT session, never from the request body.** A test scans every SQL string in the codebase (100+ queries) and fails the test suite on a data query without a tenant filter, so the rule cannot quietly erode. The Supabase public API roles are locked out of the database entirely (privileges revoked, RLS default-deny).
 
 **An LLM layer that is measured, not just added.**
-Layer 4 sends only ambiguous mid-confidence items to the model, with the top 5 candidates and **no prices**: the candidate type has no price field, so the type system rules it out. The answer is a strict JSON schema where the choice is an enum of the shown candidates or `null`, so the model cannot invent an option. Any error, timeout or invalid answer falls back to human review. The routing decision is a single side-effect-free function, `decideMatch()`, shared by the production route and an evaluation script, so the benchmark exercises exactly the production code. The labelled set has 57 estimate-style lines, a third of them traps (`B16` vs `B20`, `3×1.5` vs `3×2.5`, products not in the catalog), and the script reports accuracy, false auto-accepts, cost and latency before vs after the LLM, plus a confidence-threshold sweep so the auto-accept cutoff is chosen from data rather than guessed. The layer is off by default and toggled by an environment variable.
+Layer 4 sends ambiguous items to the model, and also asks it to confirm what the vector search would have auto-accepted. The model gets the top 5 candidates and **no prices**: the candidate type has no price field, so the type system rules it out. The answer is a strict JSON schema where the choice is an enum of the shown candidates or `null`, so the model cannot invent an option. Any error, timeout or invalid answer falls back to human review. The routing decision is a single side-effect-free function, `decideMatch()`, shared by the production route and an evaluation script, so the benchmark exercises exactly the production code.
+
+On a **held-out set** of 39 estimate-style lines (`gpt-4.1-mini`):
+
+| | Without LLM | With LLM |
+|---|---|---|
+| Items matched automatically | 18% | **51%** |
+| Precision of automatic matches | 57% | **100%** (20/20) |
+| Wrong automatic matches | 3 | **0** |
+| Cost per item | ~$0 | **~$0.0002** |
+
+The measurement also changed the design. Every error without the LLM came from high-similarity vector matches (≥ 0.9) that were auto-accepted unseen, so the LLM now confirms those too. That fixed 3 of 3 holdout errors without rejecting any of the 12 correct ones. `gpt-5-mini` was tested as well: no better, about 2.5× the cost and much slower. Caveats are documented, not hidden: the sample is small, and a single run varies by 1–2 items. The layer is off by default and toggled by an environment variable.
 
 **A company dictionary that cannot be poisoned by one click.**
 A manual decision used to become a rule that auto-accepted every future identical line. Now a human-sourced entry is trusted only when its wording is close to the chosen product (trigram similarity) or the same choice was confirmed at least twice; otherwise the item goes back through the pipeline. Users can review and delete entries in settings.
@@ -104,7 +116,7 @@ Migrations add deduplication, trigram indexing for fast fuzzy lookup, and projec
 | Auth | Custom JWT (`jose` / `jsonwebtoken`) + bcrypt, multi-tenant |
 | AI | OpenAI embeddings (semantic search), LLM re-ranking with strict structured output (optional layer) |
 | Files | `papaparse`, `xlsx`, `exceljs`, `@react-pdf/renderer` |
-| Testing | Vitest (101 unit tests, incl. the tenant-filter guard), DB checks in rolled-back transactions |
+| Testing | Vitest (195 unit tests, incl. the tenant-filter guard and offline LLM routing), DB checks in rolled-back transactions, LLM evaluation harness |
 | Deploy | Vercel |
 
 ---

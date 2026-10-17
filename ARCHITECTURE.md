@@ -21,7 +21,14 @@ An estimate item flows through ordered layers. Each layer either resolves the it
 - **A human-sourced entry is not trusted blindly.** It is used only when its wording is close to the chosen product (pg_trgm similarity ≥ 0.5) or the same target was confirmed at least twice. Otherwise the item falls through to the later layers.
 
 ### Layer 2: Parameter Extraction
-- **What it does:** pulls technical parameters from product descriptions with plain parsing, no AI. It covers cable cross-sections, diameters (`fi25`, `ø25`, `20mm`) and volume (`18 l` vs `35 l`).
+- **What it does:** pulls technical parameters from product descriptions with plain parsing, no AI. It covers:
+  - cable cross-sections and conductor size;
+  - diameters (`fi25`, `ø25`, `20mm`) and volume (`18 l` vs `35 l`);
+  - breaker curve and rating (`B16`, `C20`), residual current (`30mA`) and IP class;
+  - power (`40W`, `2x36W`), voltage and lamp base (`E27`);
+  - insulation colour.
+- **The rule:** a candidate is dropped only when both names state the parameter and the values differ.
+- **Dimensions vs cross-sections:** `NxM` counts as a cable cross-section only when M is a standard conductor size. So `600x600` and `60x60cm` are recognised as the same panel size, not as a cable.
 - **Why it matters:** a `3×2.5mm²` cable and a `3×1.5mm²` cable look almost identical to a text-similarity model, but they are different products at different prices.
 - **Where it applies:** to the Layer 1 hit and to every semantic candidate, before any fuzzy step can choose.
 
@@ -31,7 +38,9 @@ An estimate item flows through ordered layers. Each layer either resolves the it
 - **What it skips:** archived and superseded price lists. When several entries qualify, the newest valid one wins, so re-running a match gives stable results.
 
 ### Layer 4: LLM Re-ranking (optional, off by default)
-- **When it runs:** only when the best Layer 3 candidate sits in the ambiguous similarity band.
+- **When it runs:**
+  - when the best Layer 3 candidate sits in the ambiguous similarity band;
+  - to confirm the matches Layer 3 would auto-accept (similarity ≥ 0.9). The measurement showed this is where the remaining errors hid. If the LLM does not answer on a confirmation, the item goes to human review, never to an auto-accept.
 - **What the model sees:** the estimate line and up to 5 candidates that survived Layer 2, each with a name and a unit. It never sees prices, and the candidate type has no price field, so the type system enforces this.
 - **What the model can answer:** a strict JSON schema whose `choice` is an enum of the shown candidate numbers or `null`, plus a 0–100 confidence and a short reason. It cannot invent an option or echo a malformed ID.
 - **What happens next:**
@@ -55,7 +64,7 @@ An estimate item flows through ordered layers. Each layer either resolves the it
 
 ## Measuring the LLM layer
 
-The evaluation script runs `decideMatch()` over a labelled set of 57 estimate-style lines:
+The evaluation script runs `decideMatch()` over labelled sets of estimate-style lines. The first set has 57 lines:
 
 | Group | Lines |
 |---|---|
@@ -76,6 +85,34 @@ The evaluation script runs `decideMatch()` over a labelled set of 57 estimate-st
   - a confidence-threshold sweep.
 - **Dry run:** a `--dry-run` mode shows how many items would reach the LLM without calling it. A `--model` flag compares models.
 - **Safety:** the script is read-only against the database.
+
+### Results
+
+**First run (57 lines):**
+- The LLM raised the auto-match rate from 25% to 58%, and its own decisions were right in 18 of 19 cases.
+- 6 wrong auto-accepts remained. All came from Layer 3 (similarity ≥ 0.9), which the LLM did not see.
+- Fix: Layer 2 was extended to catch those traps.
+
+**Held-out set (39 lines).** The Layer 2 rules were written from the first set's errors, so re-measuring on it would be inflated. A second set with new wording, new traps and a second real supplier price list measures generalisation.
+
+| `gpt-4.1-mini`, threshold 85 | Without LLM | LLM in the ambiguous band | + LLM confirms ≥ 0.9 |
+|---|---|---|---|
+| Top-1 accuracy (22 catalog items) | 86.4% | 90.9% | **95.5%** |
+| Matched automatically | 17.9% | 56.4% | **51.3%** |
+| Precision of automatic matches | 57.1% | 86.4% | **100%** (20/20) |
+| Wrong automatic matches | 3 | 3 | **0** |
+| Cost per item | ~$0 | $0.00014 | **$0.00019** |
+| Mean latency per item | 264 ms | 823 ms | **1008 ms** |
+
+**What the runs showed:**
+- **Where the errors were.** The 3 remaining holdout errors were cases the regexes do not cover: a dimension written as `wys. 600 dł. 1000`, a missing pole count and a pump model. The LLM fixed two by picking the right candidate and rejected the third. It rejected none of the 12 correct high-similarity matches.
+- **Threshold.** The confidence sweep is flat from 50 to 95, so the cutoff barely matters. The errors that remained were never in the LLM's own decisions.
+- **Model choice.** `gpt-5-mini` was no better than `gpt-4.1-mini`, at about 2.5× the cost, several times the latency and with timeouts.
+- **Limitations, stated plainly:**
+  - **Small sample.** 39 holdout lines, so confidence intervals are wide.
+  - **Not fully independent.** The holdout was written by the same author as the rules.
+  - **Not fully deterministic.** The model is not deterministic even at temperature 0, and runs differ by 1–2 items. One known failure repeats: a `YDY 3x1.5` cable matched to the flat `YDYp` variant when the right cable was not among the candidates.
+  - **Next step.** A run on a real customer estimate comes before enabling the layer in production.
 
 ---
 
@@ -115,7 +152,9 @@ The evaluation script runs `decideMatch()` over a labelled set of 57 estimate-st
 
 ## Testing
 
-- **Vitest suite (101 tests, pure logic, no database or network):**
+- **Vitest suite (195 tests, pure logic, no database or network):**
+  - LLM routing with a fake transport (confirmations, rejections, timeouts, untouched bands);
+  - every correct pair and trap from the evaluation set, against Layer 2;
   - locale number parsing;
   - name normalization;
   - parameter extraction;
@@ -140,6 +179,9 @@ The evaluation script runs `decideMatch()` over a labelled set of 57 estimate-st
 
 ## Roadmap
 
-- **LLM layer:** run the full evaluation and set the auto-accept threshold from the data. Repeat it on a real customer estimate before enabling the layer in production.
+- **LLM layer:**
+  - repeat the evaluation several times to average out model variance;
+  - measure on a real customer estimate before enabling the layer in production;
+  - improve recall for cases where the right product is not among the top 5 candidates (`kabel` vs `przewód` wording).
 - **Stripe billing.**
 - **Supplier connectors:** broader URL connectors and scheduled sync.
