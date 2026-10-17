@@ -31,6 +31,15 @@ Electricians, plumbers and construction firms bid on jobs using cost estimates f
 - **Project snapshots and diffs.** Freeze a quote and see exactly what changed when prices move.
 - **Multi-tenant.** Every company's data is fully isolated, enforced by an automated test.
 
+| | |
+|---|---|
+| ![Project items with margin and markup](docs/screenshots/project-items.png) | ![Review queue with candidates and unit warnings](docs/screenshots/review-queue.png) |
+| *Approved quote: contract prices, margin with markup alongside* | *Review queue: candidates per item, unit mismatch warnings* |
+| ![Price lists from several wholesalers](docs/screenshots/price-lists.png) | ![Settings: margin or markup, alert threshold, company dictionary](docs/screenshots/settings.png) |
+| *Price lists from several wholesalers, superseded uploads flagged* | *Settings: margin vs markup, alert threshold, company dictionary* |
+| ![Guided onboarding tour](docs/screenshots/onboarding.png) | |
+| *14-step guided tour across the real screens* | |
+
 ---
 
 ## Architecture at a glance
